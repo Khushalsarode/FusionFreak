@@ -70,7 +70,7 @@ FusionFreakss was developed using:
 
 ---
 
-📌 Project Setup & Commands
+## 📌 Project Setup & Commands
 1️⃣ Install Devvit
 ``` bash
 $ npm install -g devvit
