@@ -1,4 +1,4 @@
-import { Devvit, useState, useAsync, useInterval, useForm } from '@devvit/public-api';
+import { Devvit, useState, useAsync, useInterval, useForm, useChannel } from '@devvit/public-api';
 
 import { getRandomSubreddits } from './subreddits.js';
 Devvit.configure({
@@ -22,7 +22,7 @@ async function createNewGamePost(context: Devvit.Context) {
     
     // Create the new game post
     const post = await reddit.submitPost({
-      title: `FusionFreak Challenge: ${roundId}`,
+      title: `🚀🌟 FusionFreak Challenge : ${roundId}`,
       subredditName: subreddit.name,
       preview: (
         <vstack height="100%" width="100%" alignment="middle center">
@@ -62,20 +62,24 @@ Devvit.addSchedulerJob({
   },
 });
 
-// 2. Add a trigger to set up the schedule when the app is installed
 Devvit.addTrigger({
-  event: 'AppInstall',
+  event: 'AppUpgrade',
   onEvent: async (_, context) => {
     try {
-      // Schedule the job to run weekly (every Monday at 9:00 AM)
+      // Same code as in AppInstall
+      const existingJobId = await context.redis.get('submash_scheduler_job_id');
+      if (existingJobId) {
+        await context.scheduler.cancelJob(existingJobId);
+        console.log(`Cancelled existing job with ID: ${existingJobId}`);
+      }
+      
       const jobId = await context.scheduler.runJob({
         name: 'create_submash_challenge',
-        cron: '* * * * *', // Run at 9:00 AM every Monday
+        cron: '59 23 * * *', 
       });
       
-      // Store the job ID in Redis so we can cancel it later if needed
       await context.redis.set('submash_scheduler_job_id', jobId);
-      console.log(`Scheduled weekly FusionFreak challenge creation with job ID: ${jobId}`);
+      console.log(`Scheduled FusionFreak challenge creation with job ID: ${jobId}`);
     } catch (e) {
       console.error("Error setting up FusionFreak challenge scheduler:", e);
     }
@@ -100,9 +104,9 @@ const scheduleManagementForm = Devvit.createForm(
       },
       {
         name: "cron",
-        label: "Schedule (cron format, e.g. '0 9 * * 1' for Mondays at 9 AM)",
+        label: "Schedule (cron format, e.g. '59 23 * * *' for Each 24 hours)",
         type: "string",
-        defaultValue: "0 9 * * 1"
+        defaultValue: "59 23 * * *"
       }
     ],
     acceptLabel: "Submit",
@@ -166,6 +170,24 @@ Devvit.addMenuItem({
   }
 });
 
+Devvit.addMenuItem({
+  label: 'Debug Scheduler',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    const { ui } = context;
+    const jobId = await context.redis.get('submash_scheduler_job_id');
+    ui.showToast(`Current job ID: ${jobId || 'None'}`);
+    
+    // Cancel the job if it exists
+    if (jobId) {
+      await context.scheduler.cancelJob(jobId);
+      await context.redis.del('submash_scheduler_job_id');
+      ui.showToast("Cancelled existing job");
+    }
+  }
+});
+
 // Add a post type definition for the game UI
 Devvit.addCustomPostType({
     name: 'FusionFreak Challenge',
@@ -185,6 +207,7 @@ const [subreddit2, setSubreddit2] = useState({ name: '', emoji: '🔄' });
         timestamp: string;
         score: number;
       } | null>(null);
+      
       const [aiDescription, setAiDescription] = useState('');
       const [currentPage, setCurrentPage] = useState(0);
       const [gameStarted, setGameStarted] = useState(false);
@@ -227,7 +250,7 @@ const [endTime, setEndTime] = useState(async () => {
   } else {
     // Create a new end time and store it in Redis
     const now = new Date();
-    const newEndTime = new Date(now.getTime() + 12 * 60 * 60 * 1000).toISOString();
+    const newEndTime = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
     await context.redis.set(endTimeKey, newEndTime);
     return newEndTime;
   }
@@ -258,6 +281,7 @@ const updateInterval = useInterval(() => {
   // Check if timer has reached zero
   if (newTimeRemaining === "00:00:00" && !gameEnded) {
     setGameEnded(true);
+    updateInterval.stop(); // Stop the interval to prevent multiple calls
     endCurrentGame();
   }
 }, 1000);
@@ -267,10 +291,37 @@ updateInterval.start();
 
 // Function to handle game ending
 const endCurrentGame = async () => {
+  // Check if this game has already been processed
+  const alreadyEnded = await context.redis.get(`game_ended_${context.postId}`);
+  if (alreadyEnded) {
+    console.log(`Game ${context.postId} already ended, skipping duplicate processing`);
+    return;
+  }
+  
+  // Use Redis transactions to ensure only one process handles the game end
+  const txn = await context.redis.watch(`game_ended_${context.postId}`);
+  await txn.multi();
+  await txn.set(`game_ended_${context.postId}`, "true");
+  const success = await txn.exec();
+  
+  if (!success) {
+    console.log("Another process is already handling game end");
+    return;
+  }
+  
   // 1. Save game results to Redis
   await context.redis.set(`game_results_${context.postId}`, JSON.stringify({
     endTime: new Date().toISOString(),
-    // Add other game stats here
+    winningSubmission: winningSubmission ? {
+      idea: winningSubmission.idea,
+      author: winningSubmission.author,
+      votes: winningSubmission.votes,
+      score: winningSubmission.score
+    } : null,
+    subreddits: {
+      subreddit1: subreddit1,
+      subreddit2: subreddit2
+    }
   }));
   
   // 2. Create a post for the ended game
@@ -278,35 +329,50 @@ const endCurrentGame = async () => {
     // Use Reddit API to create a new post
     const newPostResponse = await context.reddit.submitPost({
       subredditName: context.subredditName ?? 'defaultSubreddit',
-      title: `Game Results - ${context.postId} ${new Date().toLocaleDateString()}`,
+      title: `Game Results - ${new Date().toLocaleString()}`,
       text: `The game has ended! Final results: Thank you for playing! \n
       Game Over! Check the results. \n Submissions are now closed. \n Schedule New Fusion Game! \n
       - Fusion Subreddits: ${subreddit1.emoji} r/${subreddit1.name} + ${subreddit2.emoji} r/${subreddit2.name} \n
-      - 🥇Winning Idea: ${winningSubmission?.idea || ''} \n
+      - 🥇Winning Idea: ${winningSubmission?.idea.toLocaleUpperCase() || ''} \n
       - 🔼 Votes: ${winningSubmission?.votes ?? 0} \n
       - 🥑 Submitted by: u/${winningSubmission?.author || 'Unknown'} \n
       - 🔥 score: ${winningSubmission?.score ?? 0}`,
-    }); 
+    });
     
     // 3. Start a new game
     const newGamePostId = newPostResponse.id;
     
     // Set up the new game with a new end time
     const now = new Date();
-    const newEndTime = new Date(now.getTime() + 12 * 60 * 60 * 1000).toISOString();
+    const newEndTime = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
     await context.redis.set(`endTime_${newGamePostId}`, newEndTime);
     
-    // Optionally, notify all clients about the new game
+    // Notify all clients about the new game
     context.realtime.send('new_game_started', { 
       newGamePostId,
       newEndTime
     });
+    
+    console.log(`Successfully created new game with ID: ${newGamePostId}`);
   } catch (error) {
     console.error("Error creating new game:", error);
+    // If there was an error, remove the game_ended flag so another attempt can be made
+    await context.redis.del(`game_ended_${context.postId}`);
   }
 };
 
-            
+// Add a channel subscription to handle game end events from other clients
+const channel = useChannel({
+  name: 'game_channel',
+  onMessage: (message: { type: string; postId: string }) => {
+    if (message && message.type === 'game_ended' && message.postId === context.postId) {
+      setGameEnded(true);
+      updateInterval.stop();
+    }
+  }
+});
+
+channel.subscribe();            
       // Inside your render function, add this form definition:
       const ideaSubmissionForm = useForm(
         {
@@ -318,22 +384,22 @@ const endCurrentGame = async () => {
               color: 'red',
               multiline: true,
               required: true,
-              helpText: `Include both "${subreddit1.name}" and "${subreddit2.name}" in your Fusion (max 15 words)`,
+              helpText: `Include both "${subreddit1.name}" and "${subreddit2.name}" in your Fusion (max 10 words)`,
               onValidate: ({ value }: { value: string }) => {
                 // Check word count (max 50 words)
                 const wordCount = value.trim().split(/\s+/).length;
-                if (wordCount > 15) {
-                  return 'Your Fusion must be 15 words or less';
+                if (wordCount > 10) {
+                  return 'Your Fusion must be 10 words or less';
                 }
                 
                 // Check if both subreddit names are included
                 const lowerCaseValue = value.toLowerCase();
-                //const sub1Included = lowerCaseValue.includes(subreddit1.name.toLowerCase());
-                //const sub2Included = lowerCaseValue.includes(subreddit2.name.toLowerCase());
+                const sub1Included = lowerCaseValue.includes(subreddit1.name.toLowerCase());
+                const sub2Included = lowerCaseValue.includes(subreddit2.name.toLowerCase());
                 
-                //if (!sub1Included || !sub2Included) {
-                //  return `Your Fusion must include both "${subreddit1.name}" and "${subreddit2.name}"`;
-                //}
+                if (!sub1Included || !sub2Included) {
+                 return `Your Fusion must include both "${subreddit1.name}" and "${subreddit2.name}"`;
+                }
               }
             },
           ],
@@ -347,10 +413,10 @@ const endCurrentGame = async () => {
           // Double-check validation criteria
           const wordCount = values.idea.trim().split(/\s+/).length;
           const lowerCaseValue = values.idea.toLowerCase();
-          //const sub1Included = lowerCaseValue.includes(subreddit1.name.toLowerCase());
-          //const sub2Included = lowerCaseValue.includes(subreddit2.name.toLowerCase());
+          const sub1Included = lowerCaseValue.includes(subreddit1.name.toLowerCase());
+          const sub2Included = lowerCaseValue.includes(subreddit2.name.toLowerCase());
           
-          if (wordCount > 15 ){   //|| !sub1Included || !sub2Included) {
+          if (wordCount > 10 || !sub1Included || !sub2Included) {
               context.ui.showToast({
                   appearance: 'neutral',
                   text:'❌Fusion Rejection! Your Fusion must be 50 words or less'
@@ -504,45 +570,86 @@ const endCurrentGame = async () => {
       
   
       // Vote on an idea
-      const handleVote = async (id: string) => {
-        try {
-          const postId = context.postId;
-          const submissionsKey = `submissions_${postId}`;
-          const submissionsJson = await context.redis.get(submissionsKey);
-          let existingSubmissions: Array<{id: string; idea: string; author: string; votes: number; timestamp: string; score: number;}> = [];
-          
-          if (submissionsJson) {
-            try {
-              existingSubmissions = JSON.parse(submissionsJson);
-            } catch (e) {
-              console.error("Error parsing submissions:", e);
-            }
-          }
-          
-          const updatedSubmissions = existingSubmissions.map(sub => 
-            sub.id === id ? {...sub, votes: (sub.votes || 0) + 1, score: (sub.score || 0) + 10} : sub
-          );
-          
-          // Save to Redis
-          await context.redis.set(submissionsKey, JSON.stringify(updatedSubmissions));
-          
-          // Update local state
-          setSubmissions(updatedSubmissions);
-          
-          // Update the winning idea
-          const topSubmission = [...updatedSubmissions].sort((a, b) => b.votes - a.votes)[0];
-          if (topSubmission) {
-            setWinningSubmission(topSubmission);
-          }
-          
-          // Find the submission that was voted on to show the author in the toast
-          const votedSubmission = updatedSubmissions.find(sub => sub.id === id);
-          context.ui.showToast(`Vote recorded! +10 points to ${votedSubmission?.author || 'user'}`);
-        } catch (error) {
-          console.error("Error voting:", error);
-          context.ui.showToast('Failed to record your vote. Please try again.');
-        }
-      };
+const handleVote = async (id: string) => {
+  try {
+    const postId = context.postId;
+    const submissionsKey = `submissions_${postId}`;
+    const username = context.userId || 'anonymous'; // Get current user
+    const userVotesKey = `user_votes_${postId}_${username}`; // Key to track user votes
+    
+    // Check if user has already voted on this idea
+    const userVotesJson = await context.redis.get(userVotesKey);
+    let userVotes: string[] = userVotesJson ? JSON.parse(userVotesJson) : [];
+    
+    if (userVotes.includes(id)) {
+      context.ui.showToast('You have already voted on this idea!');
+      return;
+    }
+    
+    // Use Redis transaction to ensure data consistency
+    const txn = await context.redis.watch(submissionsKey);
+    await txn.multi();
+    
+    // Get current submissions
+    const submissionsJson = await context.redis.get(submissionsKey);
+    
+    // Define the type for submissions
+    type Submission = {
+      id: string;
+      idea: string;
+      author: string;
+      votes: number;
+      timestamp: string;
+      score: number;
+    };
+    
+    let existingSubmissions: Submission[] = [];
+    
+    if (submissionsJson) {
+      try {
+        existingSubmissions = JSON.parse(submissionsJson);
+      } catch (e) {
+        console.error("Error parsing submissions:", e);
+      }
+    }
+    
+    // Update the submission with the new vote
+    const updatedSubmissions = existingSubmissions.map((sub: Submission) => 
+      sub.id === id ? {...sub, votes: (sub.votes || 0) + 1, score: (sub.score || 0) + 10} : sub
+    );
+    
+    // Save updated submissions
+    await txn.set(submissionsKey, JSON.stringify(updatedSubmissions));
+    
+    // Add this idea to user's voted list
+    userVotes.push(id);
+    await txn.set(userVotesKey, JSON.stringify(userVotes));
+    
+    // Execute the transaction
+    const success = await txn.exec();
+    
+    if (!success) {
+      context.ui.showToast('Error recording vote. Please try again.');
+      return;
+    }
+    
+    // Update local state
+    setSubmissions(updatedSubmissions);
+    
+    // Update the winning idea
+    const topSubmission = [...updatedSubmissions].sort((a, b) => b.votes - a.votes)[0];
+    if (topSubmission) {
+      setWinningSubmission(topSubmission);
+    }
+    
+    // Find the submission that was voted on to show the author in the toast
+    const votedSubmission = updatedSubmissions.find(sub => sub.id === id);
+    context.ui.showToast(`Vote recorded! +10 points to ${votedSubmission?.author || 'user'}`);
+  } catch (error) {
+    console.error("Error voting:", error);
+    context.ui.showToast('Failed to record your vote. Please try again.');
+  }
+};
       
       // Use useAsync to load submissions
         useAsync(async () => {
@@ -583,7 +690,19 @@ const endCurrentGame = async () => {
           }))
           .sort((a, b) => b.score - a.score); // Sort by score in descending order
           
-          
+        // Use the useAsync hook to fetch data
+        const { data: topSubmissions, loading, error } = useAsync(async () => {
+          return await context.redis.zRange('leaderboard', 0, 2, {
+            reverse: true,  // To get highest scores first
+            by: 'rank',
+          });
+        });
+
+        // Destructure the results for easy access (only if data is available)
+        const firstPlace = topSubmissions?.[0];
+        const secondPlace = topSubmissions?.[1];
+        const thirdPlace = topSubmissions?.[2];
+
 return (
   <blocks height="tall">
     {!gameStarted ? (
@@ -600,8 +719,9 @@ return (
                   <text size="xlarge">🔀</text>
                   <vstack alignment="start" grow>
                     <text size="medium" weight="bold">1. Create Your Fusion</text>
-                    <text size="small">Blend two subreddits into one brilliant idea! Think r/AskScience + r/Cooking= </text>
-                    <text size='small'>"Scientists explain why your pasta always sticks together"</text>
+                    <text size="small">Blend two subreddits into one brilliant idea! Think r/esports + r/leagueoflegends.</text>
+                    <text size='small'>"Pro teams battle fiercely in Worlds, chasing ultimate esports glory!"</text>
+                    <text size='small'>"Faker dominates Worlds, esports fans cheer, League of Legends thrives!"</text>
                   </vstack>
                 </hstack>
                 
@@ -625,7 +745,7 @@ return (
                 <vstack gap="small" alignment="start" border="thin" cornerRadius="medium" padding="small" backgroundColor="#2D2D2E" width="100%">
                   <text weight="bold" size="medium" alignment="center" width="100%">📋 The Rules</text>
                   <text size="small" alignment='middle'>• 🔤 Your fusion MUST include both subreddit names</text>
-                  <text size="small" alignment='middle'>• 📝 Keep it under 15 words (brevity is the soul of wit!)</text>
+                  <text size="small" alignment='middle'>• 📝 Keep it under 10 words (brevity is the soul of wit!)</text>
                   <text size="small" alignment='middle'>• 👤 One submission per user per round</text>
                   <text size="small" alignment='middle'>• 🎭 Be creative, funny, and keep it community-friendly</text>
                   <text size="small" alignment='middle'>• 🔄 New rounds start daily with fresh subreddit pairs</text>
@@ -697,7 +817,7 @@ return (
           {winningSubmission && (
             <vstack width="100%" padding="small">
               <text size="large" alignment="center" width="100%">
-                {winningSubmission.idea}
+                {winningSubmission.idea.toLocaleUpperCase()}
               </text>
             </vstack>
           )}
